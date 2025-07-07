@@ -25,8 +25,18 @@ if uploaded_files:
         lines = all_text.splitlines()
         current_invoice = None
         current_total = None
+        invoice_date = None  # Initialize invoice date
         i = 0
 
+        # Step 1: Look for Invoice Date
+        for line in lines:
+            line = line.strip()
+            match = re.match(r"^\S+\s+(\d{2}/\d{2}/\d{4})\s+(\d{9,12})$", line)
+            if match:
+                invoice_date = match.group(1)
+                break
+
+        # Step 2: Parse invoice items
         while i < len(lines):
             line = lines[i].strip()
 
@@ -82,6 +92,7 @@ if uploaded_files:
                     all_items.append({
                         "PDF File": pdf_file,
                         "Invoice #": current_invoice,
+                        "Invoice Date": invoice_date,
                         "Item Number": item_num,
                         "Description": description,
                         "Quantity": qty,
