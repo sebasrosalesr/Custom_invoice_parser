@@ -5,14 +5,42 @@ import pandas as pd
 
 st.title("📄 PDF Invoice Extractor - Medline")
 
-uploaded_files = st.file_uploader("Upload Medline PDF invoices", type="pdf", accept_multiple_files=True)
+uploaded_files = st.file_uploader(
+    "Upload Medline PDF invoices",
+    type="pdf",
+    accept_multiple_files=True
+)
 
 all_items = []
+
+
+def extract_invoice_date(lines):
+    """Find the first invoice date in the PDF text."""
+    for line in lines:
+        line = line.strip()
+        match = re.match(r"^\S+\s+(\d{2}/\d{2}/\d{4})\s+(\d{9,12})$", line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def extract_amount_due_fallback(lines, start_index):
+    """
+    Try to capture invoice total near 'AMOUNT DUE'.
+    Looks ahead a few lines in case PDF text is split oddly.
+    """
+    for j in range(start_index, min(start_index + 4, len(lines))):
+        amount_match = re.search(r"\$?\(?([\d,]+\.\d{2})\)?", lines[j])
+        if amount_match:
+            return float(amount_match.group(1).replace(",", ""))
+    return None
+
 
 if uploaded_files:
     for uploaded_file in uploaded_files:
         pdf_file = uploaded_file.name
         st.write(f"📂 Processing: {pdf_file}")
+
         all_text = ""
 
         with pdfplumber.open(uploaded_file) as pdf:
@@ -23,20 +51,12 @@ if uploaded_files:
                     all_text += page_text + "\n"
 
         lines = all_text.splitlines()
+        invoice_date = extract_invoice_date(lines)
+
         current_invoice = None
         current_total = None
-        invoice_date = None  # Initialize invoice date
         i = 0
 
-        # Step 1: Look for Invoice Date
-        for line in lines:
-            line = line.strip()
-            match = re.match(r"^\S+\s+(\d{2}/\d{2}/\d{4})\s+(\d{9,12})$", line)
-            if match:
-                invoice_date = match.group(1)
-                break
-
-        # Step 2: Parse invoice items
         while i < len(lines):
             line = lines[i].strip()
 
@@ -47,13 +67,12 @@ if uploaded_files:
                 st.write(f"🧾 Invoice #: {current_invoice}")
                 current_total = None
 
-            # Detect total amount
-            if "AMOUNT DUE" in line.upper() and i + 1 < len(lines):
-                amount_match = re.search(r"\$([\d,.]+)", lines[i + 1])
-                if amount_match:
-                    current_total = float(amount_match.group(1).replace(",", ""))
+            # Detect total amount near AMOUNT DUE
+            if "AMOUNT DUE" in line.upper():
+                detected_total = extract_amount_due_fallback(lines, i + 1)
+                if detected_total is not None:
+                    current_total = detected_total
                     st.write(f"💵 Total for invoice {current_invoice}: {current_total}")
-                i += 1
 
             # Match item line
             item_match = re.match(
@@ -72,9 +91,9 @@ if uploaded_files:
             if item_match:
                 qty = float(item_match.group("qty"))
                 uom = item_match.group("uom")
-                invoice_qty = float(item_match.group("inv_qty"))
                 item_num = item_match.group("item").strip("-.,").upper()
                 delivery = item_match.group("delivery")
+
                 unit_price_str = item_match.group("unit_price")
                 amount_str = item_match.group("amount")
 
@@ -104,19 +123,69 @@ if uploaded_files:
                     })
                 else:
                     st.warning(f"⚠️ Skipped item — no invoice number set for: {item_num}")
+
             i += 1
 
     df_all = pd.DataFrame(all_items)
 
     if not df_all.empty:
+        # Fallback: if Total Invoice is missing, fill it with sum of Spend per invoice
+        computed_totals = (
+            df_all.groupby("Invoice #", dropna=False)["Spend"]
+            .sum(min_count=1)
+            .reset_index()
+            .rename(columns={"Spend": "Computed Total Invoice"})
+        )
+
+        df_all = df_all.merge(computed_totals, on="Invoice #", how="left")
+        df_all["Total Invoice"] = df_all["Total Invoice"].fillna(df_all["Computed Total Invoice"])
+        df_all.drop(columns=["Computed Total Invoice"], inplace=True)
+
+        # Optional validation check: compare extracted total vs computed spend total
+        validation = (
+            df_all.groupby("Invoice #", dropna=False)
+            .agg(
+                Extracted_Total=("Total Invoice", "first"),
+                Summed_Spend=("Spend", lambda x: x.sum(min_count=1))
+            )
+            .reset_index()
+        )
+
+        validation["Difference"] = validation["Extracted_Total"] - validation["Summed_Spend"]
+        validation["Difference"] = validation["Difference"].round(2)
+
+        mismatches = validation[
+            validation["Extracted_Total"].notna() &
+            validation["Summed_Spend"].notna() &
+            (validation["Difference"].abs() > 0.01)
+        ]
+
         st.subheader("📊 Extracted Items")
         st.dataframe(df_all)
 
-        csv = df_all.to_csv(index=False).encode('utf-8')
-        st.download_button("📥 Download CSV", data=csv, file_name="medline_items_extracted.csv", mime="text/csv")
+        csv = df_all.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Download CSV",
+            data=csv,
+            file_name="medline_items_extracted.csv",
+            mime="text/csv"
+        )
 
         if df_all["Spend"].isna().any():
             st.warning("⚠️ Some items are missing Spend values:")
-            st.dataframe(df_all[df_all["Spend"].isna()][["Invoice #", "Item Number", "Description"]])
+            st.dataframe(
+                df_all[df_all["Spend"].isna()][["Invoice #", "Item Number", "Description"]]
+            )
+
+        if df_all["Total Invoice"].isna().any():
+            st.warning("⚠️ Some invoices still have missing Total Invoice values after fallback:")
+            st.dataframe(
+                df_all[df_all["Total Invoice"].isna()][["Invoice #"]].drop_duplicates()
+            )
+
+        if not mismatches.empty:
+            st.warning("⚠️ Some invoices have a mismatch between Total Invoice and summed Spend:")
+            st.dataframe(mismatches)
+
     else:
         st.error("❌ No valid items extracted from the uploaded PDFs.")
