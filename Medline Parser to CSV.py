@@ -29,8 +29,9 @@ def extract_amount_due_fallback(lines, start_index):
     Try to capture invoice total near 'AMOUNT DUE'.
     Looks ahead a few lines in case PDF text is split oddly.
     """
-    for j in range(start_index, min(start_index + 4, len(lines))):
-        amount_match = re.search(r"\$?\(?([\d,]+\.\d{2})\)?", lines[j])
+    for j in range(start_index, min(start_index + 5, len(lines))):
+        candidate = lines[j].strip()
+        amount_match = re.search(r"\$?\(?([\d,]+\.\d{2})\)?", candidate)
         if amount_match:
             return float(amount_match.group(1).replace(",", ""))
     return None
@@ -129,33 +130,33 @@ if uploaded_files:
     df_all = pd.DataFrame(all_items)
 
     if not df_all.empty:
-        # Fallback: if Total Invoice is missing, fill it with sum of Spend per invoice
-        computed_totals = (
-            df_all.groupby("Invoice #", dropna=False)["Spend"]
-            .sum(min_count=1)
-            .reset_index()
-            .rename(columns={"Spend": "Computed Total Invoice"})
-        )
+        # Force Total Invoice to numeric so blanks become NaN
+        df_all["Total Invoice"] = pd.to_numeric(df_all["Total Invoice"], errors="coerce")
+        df_all["Spend"] = pd.to_numeric(df_all["Spend"], errors="coerce")
 
-        df_all = df_all.merge(computed_totals, on="Invoice #", how="left")
-        df_all["Total Invoice"] = df_all["Total Invoice"].fillna(df_all["Computed Total Invoice"])
-        df_all.drop(columns=["Computed Total Invoice"], inplace=True)
+        # 1. Propagate any extracted invoice total to all rows in that invoice
+        extracted_invoice_totals = df_all.groupby("Invoice #")["Total Invoice"].transform("max")
 
-        # Optional validation check: compare extracted total vs computed spend total
+        # 2. Compute fallback totals from Spend sum per invoice
+        computed_invoice_totals = df_all.groupby("Invoice #")["Spend"].transform("sum")
+
+        # 3. Prefer extracted total, otherwise fallback to computed sum
+        df_all["Total Invoice"] = extracted_invoice_totals.fillna(computed_invoice_totals)
+
+        # Validation table
         validation = (
             df_all.groupby("Invoice #", dropna=False)
             .agg(
-                Extracted_Total=("Total Invoice", "first"),
-                Summed_Spend=("Spend", lambda x: x.sum(min_count=1))
+                Total_Invoice=("Total Invoice", "first"),
+                Summed_Spend=("Spend", "sum")
             )
             .reset_index()
         )
 
-        validation["Difference"] = validation["Extracted_Total"] - validation["Summed_Spend"]
-        validation["Difference"] = validation["Difference"].round(2)
+        validation["Difference"] = (validation["Total_Invoice"] - validation["Summed_Spend"]).round(2)
 
         mismatches = validation[
-            validation["Extracted_Total"].notna() &
+            validation["Total_Invoice"].notna() &
             validation["Summed_Spend"].notna() &
             (validation["Difference"].abs() > 0.01)
         ]
@@ -178,7 +179,7 @@ if uploaded_files:
             )
 
         if df_all["Total Invoice"].isna().any():
-            st.warning("⚠️ Some invoices still have missing Total Invoice values after fallback:")
+            st.warning("⚠️ Some invoices still have missing Total Invoice values:")
             st.dataframe(
                 df_all[df_all["Total Invoice"].isna()][["Invoice #"]].drop_duplicates()
             )
